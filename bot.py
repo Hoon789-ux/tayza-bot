@@ -57,9 +57,7 @@ ENROLL_MSG = """🙌 ကောင်းတယ်! လျှောက်ထား
    ဖုန်းနံပါတ် — `""" + KBZPAY_NUMBER + """`
    အကောင့်အမည် — """ + KBZPAY_NAME + """
 
-📱 Wave Pay
-   ဖုန်းနံပါတ် — `""" + WAVEPAY_NUMBER + """`
-   အကောင့်အမည် — """ + WAVEPAY_NAME + """
+
 
 💰 ပမာဏ — """ + COURSE_PRICE + """
 
