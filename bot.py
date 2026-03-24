@@ -6,7 +6,8 @@ import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters
+    CallbackQueryHandler, ContextTypes, filters,
+    ConversationHandler
 )
 import anthropic
 
@@ -21,6 +22,11 @@ KBZPAY_NAME      = os.getenv("KBZPAY_NAME", "TayZa")
 SUPABASE_URL     = "https://fzqbrtxkanqubneltdqu.supabase.co"
 SUPABASE_KEY     = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZ6cWJydHhrYW5xdWJuZWx0ZHF1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQyOTUzMTEsImV4cCI6MjA4OTg3MTMxMX0.-4NarhDoyyU7-nl_r_Ck2BJzXwwJsnKHzxfKwZ4XG8c"
 ADMINS           = (ADMIN_CHAT_ID, SECOND_ADMIN_ID)
+
+# Conversation states
+WAITING_WELCOME_TEXT  = 1
+WAITING_ENROLL_TEXT   = 2
+WAITING_APPROVED_TEXT = 3
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -134,9 +140,9 @@ async def admin_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🎉 Set Approve Video", callback_data="menu_setapprovevideo"),
          InlineKeyboardButton("🗑 Remove", callback_data="menu_removeapprovevideo")],
         [InlineKeyboardButton("📝 TEXT SETTINGS", callback_data="menu_ignore")],
-        [InlineKeyboardButton("👋 View Welcome Text", callback_data="menu_viewwelcometext")],
-        [InlineKeyboardButton("🙌 View Enroll Text", callback_data="menu_viewenrolltext")],
-        [InlineKeyboardButton("🎊 View Approved Text", callback_data="menu_viewapprovedtext")],
+        [InlineKeyboardButton("👋 Edit Welcome Text", callback_data="menu_editwelcometext")],
+        [InlineKeyboardButton("🙌 Edit Enroll Text", callback_data="menu_editenrolltext")],
+        [InlineKeyboardButton("🎊 Edit Approved Text", callback_data="menu_editapprovedtext")],
         [InlineKeyboardButton("🔄 Reset Welcome Text", callback_data="menu_resetwelcometext")],
         [InlineKeyboardButton("🔄 Reset Enroll Text", callback_data="menu_resetenrolltext")],
         [InlineKeyboardButton("🔄 Reset Approved Text", callback_data="menu_resetapprovedtext")],
@@ -159,62 +165,73 @@ async def handle_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         w = get_video("welcome")
         e = get_video("enroll")
         a = get_video("approve")
-        start_status = "✅ Set" if w else "❌ Not set"
-        enroll_status = "✅ Set" if e else "❌ Not set"
-        approve_status = "✅ Set" if a else "❌ Not set"
-        await query.message.reply_text(f"📹 Video Status\n\n/start video: {start_status}\n/enroll video: {enroll_status}\nApprove video: {approve_status}")
+        await query.message.reply_text(
+            f"📹 Video Status\n\n"
+            f"/start video: {'✅ Set' if w else '❌ Not set'}\n"
+            f"/enroll video: {'✅ Set' if e else '❌ Not set'}\n"
+            f"Approve video: {'✅ Set' if a else '❌ Not set'}"
+        )
 
     elif action == "menu_setwelcomevideo":
         await query.message.reply_text("📹 Send the welcome video to the bot, then reply to it with:\n/setwelcomevideo")
-
     elif action == "menu_setenrollvideo":
         await query.message.reply_text("📹 Send the enroll video to the bot, then reply to it with:\n/setenrollvideo")
-
     elif action == "menu_setapprovevideo":
         await query.message.reply_text("📹 Send the approve video to the bot, then reply to it with:\n/setapprovevideo")
 
     elif action == "menu_removewelcomevideo":
         remove_video("welcome")
         await query.message.reply_text("✅ Welcome video removed!")
-
     elif action == "menu_removeenrollvideo":
         remove_video("enroll")
         await query.message.reply_text("✅ Enroll video removed!")
-
     elif action == "menu_removeapprovevideo":
         remove_video("approve")
         await query.message.reply_text("✅ Approve video removed!")
 
-    elif action == "menu_viewwelcometext":
-        text = get_text("welcome", DEFAULT_WELCOME)
-        await query.message.reply_text(f"📝 Current welcome text:\n\n{text}\n\nTo edit:\n/setwelcometext your new text here")
-
-    elif action == "menu_viewenrolltext":
-        text = get_text("enroll", DEFAULT_ENROLL)
-        await query.message.reply_text(f"📝 Current enroll text:\n\n{text}\n\nTo edit:\n/setenrolltext your new text here")
-
-    elif action == "menu_viewapprovedtext":
-        text = get_text("approved", DEFAULT_APPROVED)
-        await query.message.reply_text(f"📝 Current approved text:\n\n{text}\n\nTo edit:\n/setapprovedtext your new text here")
+    elif action == "menu_editwelcometext":
+        current = get_text("welcome", DEFAULT_WELCOME)
+        ctx.user_data["editing"] = "welcome"
+        await query.message.reply_text(
+            f"📝 Current welcome text:\n\n{current}\n\n"
+            "━━━━━━━━━━━━━━━\n\n"
+            "Now send me the new welcome text as your next message.\n"
+            "Type /cancel to cancel."
+        )
+    elif action == "menu_editenrolltext":
+        current = get_text("enroll", DEFAULT_ENROLL)
+        ctx.user_data["editing"] = "enroll"
+        await query.message.reply_text(
+            f"📝 Current enroll text:\n\n{current}\n\n"
+            "━━━━━━━━━━━━━━━\n\n"
+            "Now send me the new enroll text as your next message.\n"
+            "Type /cancel to cancel."
+        )
+    elif action == "menu_editapprovedtext":
+        current = get_text("approved", DEFAULT_APPROVED)
+        ctx.user_data["editing"] = "approved"
+        await query.message.reply_text(
+            f"📝 Current approved text:\n\n{current}\n\n"
+            "━━━━━━━━━━━━━━━\n\n"
+            "Now send me the new approved text as your next message.\n"
+            "Type /cancel to cancel."
+        )
 
     elif action == "menu_resetwelcometext":
         reset_text("welcome")
         await query.message.reply_text("✅ Welcome text reset to default!")
-
     elif action == "menu_resetenrolltext":
         reset_text("enroll")
         await query.message.reply_text("✅ Enroll text reset to default!")
-
     elif action == "menu_resetapprovedtext":
         reset_text("approved")
         await query.message.reply_text("✅ Approved text reset to default!")
 
 
-# ── ADMIN VIDEO/TEXT COMMANDS ─────────────────────────────────────────────────
+# ── ADMIN VIDEO COMMANDS ──────────────────────────────────────────────────────
 
 async def set_welcome_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMINS:
-        return
+    if update.effective_user.id not in ADMINS: return
     if not update.message.reply_to_message or not update.message.reply_to_message.video:
         await update.message.reply_text("⚠️ Video message ကို reply လုပ်ပြီး /setwelcomevideo နှိပ်ပါ။")
         return
@@ -222,8 +239,7 @@ async def set_welcome_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Welcome video set!")
 
 async def set_enroll_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMINS:
-        return
+    if update.effective_user.id not in ADMINS: return
     if not update.message.reply_to_message or not update.message.reply_to_message.video:
         await update.message.reply_text("⚠️ Video message ကို reply လုပ်ပြီး /setenrollvideo နှိပ်ပါ။")
         return
@@ -231,8 +247,7 @@ async def set_enroll_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Enroll video set!")
 
 async def set_approve_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMINS:
-        return
+    if update.effective_user.id not in ADMINS: return
     if not update.message.reply_to_message or not update.message.reply_to_message.video:
         await update.message.reply_text("⚠️ Video message ကို reply လုပ်ပြီး /setapprovevideo နှိပ်ပါ။")
         return
@@ -259,56 +274,17 @@ async def video_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     w = get_video("welcome")
     e = get_video("enroll")
     a = get_video("approve")
-    start_status = "✅ Set" if w else "❌ Not set"
-    enroll_status = "✅ Set" if e else "❌ Not set"
-    approve_status = "✅ Set" if a else "❌ Not set"
-    await update.message.reply_text(f"📹 Video Status\n\n/start video: {start_status}\n/enroll video: {enroll_status}\nApprove video: {approve_status}")
+    await update.message.reply_text(
+        f"📹 Video Status\n\n"
+        f"/start video: {'✅ Set' if w else '❌ Not set'}\n"
+        f"/enroll video: {'✅ Set' if e else '❌ Not set'}\n"
+        f"Approve video: {'✅ Set' if a else '❌ Not set'}"
+    )
 
-async def set_welcome_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMINS: return
-    new_text = " ".join(ctx.args) if ctx.args else None
-    if not new_text:
-        current = get_text("welcome", DEFAULT_WELCOME)
-        await update.message.reply_text(f"📝 Current welcome text:\n\n{current}\n\nTo change:\n/setwelcometext your new text")
-        return
-    set_text("welcome", new_text)
-    await update.message.reply_text(f"✅ Welcome text updated!\n\nPreview:\n\n{new_text}")
-
-async def set_enroll_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMINS: return
-    new_text = " ".join(ctx.args) if ctx.args else None
-    if not new_text:
-        current = get_text("enroll", DEFAULT_ENROLL)
-        await update.message.reply_text(f"📝 Current enroll text:\n\n{current}\n\nTo change:\n/setenrolltext your new text")
-        return
-    set_text("enroll", new_text)
-    await update.message.reply_text(f"✅ Enroll text updated!\n\nPreview:\n\n{new_text}")
-
-async def set_approved_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMINS: return
-    new_text = " ".join(ctx.args) if ctx.args else None
-    if not new_text:
-        current = get_text("approved", DEFAULT_APPROVED)
-        await update.message.reply_text(f"📝 Current approved text:\n\n{current}\n\nTo change:\n/setapprovedtext your new text")
-        return
-    set_text("approved", new_text)
-    await update.message.reply_text(f"✅ Approved text updated!\n\nPreview:\n\n{new_text}")
-
-async def reset_welcome_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMINS: return
-    reset_text("welcome")
-    await update.message.reply_text("✅ Welcome text reset to default!")
-
-async def reset_enroll_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMINS: return
-    reset_text("enroll")
-    await update.message.reply_text("✅ Enroll text reset to default!")
-
-async def reset_approved_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMINS: return
-    reset_text("approved")
-    await update.message.reply_text("✅ Approved text reset to default!")
-
+    ctx.user_data.pop("editing", None)
+    await update.message.reply_text("❌ Cancelled. Type /menu to go back.")
 
 # ── MAIN HANDLERS ─────────────────────────────────────────────────────────────
 
@@ -354,9 +330,9 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             model="claude-sonnet-4-20250514", max_tokens=500,
             messages=[{"role": "user", "content": [
                 {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
-                {"type": "text", "text": f"""This is a payment screenshot for a course enrollment. The course costs {COURSE_PRICE} (50000 Myanmar Kyats).
-Check: 1) Is this legitimate KBZPay? 2) Amount matches 50,000 MMK? 3) Transaction ID? 4) Date/time? 5) Recipient name?
-Reply ONLY in this JSON format:
+                {"type": "text", "text": f"""Payment screenshot for course enrollment. Course costs {COURSE_PRICE} (50000 MMK).
+Check: 1) Legitimate KBZPay? 2) Amount 50,000 MMK? 3) Transaction ID? 4) Date/time? 5) Recipient name?
+Reply ONLY in JSON:
 {{"looks_valid": true/false, "amount_detected": "amount or null", "payment_method": "KBZPay/unknown", "transaction_id": "ID or null", "transaction_date": "date or null", "recipient_name": "name or null", "confidence": "high/medium/low", "notes": "brief note"}}"""}
             ]}]
         )
@@ -378,9 +354,8 @@ Reply ONLY in this JSON format:
             await ctx.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"🚨 Duplicate receipt!\n\n👤 {user.full_name} (@{user.username or 'no username'})\n🆔 {uid}\n📋 Txn: {txn_id}")
             return
         save_txn(txn_id)
-        valid_text = "Valid" if valid else "Suspicious"
         txn_warning = "\n⚠️ Transaction ID မတွေ့" if not txn_id else ""
-        ai_summary = f"{'✅' if valid else '⚠️'} AI: {valid_text}\n💰 {amount}\n📱 {method}\n🧾 {txn_id or 'မတွေ့'}\n📅 {txn_date}\n👤 {recipient}\n🎯 {confidence}\n📝 {notes}{txn_warning}"
+        ai_summary = f"{'✅' if valid else '⚠️'} AI: {'Valid' if valid else 'Suspicious'}\n💰 {amount}\n📱 {method}\n🧾 {txn_id or 'မတွေ့'}\n📅 {txn_date}\n👤 {recipient}\n🎯 {confidence}\n📝 {notes}{txn_warning}"
     except Exception as e:
         log.error(f"Claude API error: {e}")
         ai_summary = "⚠️ AI စစ်ဆေးမရ — ကိုယ်တိုင် စစ်ဆေးပါ"
@@ -416,6 +391,15 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid   = update.effective_user.id
+
+    # Admin editing text flow
+    if uid in ADMINS and ctx.user_data.get("editing"):
+        key = ctx.user_data.pop("editing")
+        new_text = update.message.text
+        set_text(key, new_text)
+        await update.message.reply_text(f"✅ Text updated!\n\nPreview:\n\n{new_text}\n\nType /menu to go back.")
+        return
+
     state = get_state(uid)
     if state == "new":
         await update.message.reply_text(get_text("welcome", DEFAULT_WELCOME))
@@ -431,6 +415,7 @@ def main():
     app.add_handler(CommandHandler("start",               start))
     app.add_handler(CommandHandler("enroll",              enroll))
     app.add_handler(CommandHandler("menu",                admin_menu))
+    app.add_handler(CommandHandler("cancel",              cancel))
     app.add_handler(CommandHandler("setwelcomevideo",     set_welcome_video))
     app.add_handler(CommandHandler("setenrollvideo",      set_enroll_video))
     app.add_handler(CommandHandler("setapprovevideo",     set_approve_video))
@@ -438,12 +423,6 @@ def main():
     app.add_handler(CommandHandler("removeenrollvideo",   remove_enroll_video))
     app.add_handler(CommandHandler("removeapprovevideo",  remove_approve_video))
     app.add_handler(CommandHandler("videostatus",         video_status))
-    app.add_handler(CommandHandler("setwelcometext",      set_welcome_text))
-    app.add_handler(CommandHandler("setenrolltext",       set_enroll_text))
-    app.add_handler(CommandHandler("setapprovedtext",     set_approved_text))
-    app.add_handler(CommandHandler("resetwelcometext",    reset_welcome_text))
-    app.add_handler(CommandHandler("resetenrolltext",     reset_enroll_text))
-    app.add_handler(CommandHandler("resetapprovedtext",   reset_approved_text))
     app.add_handler(CallbackQueryHandler(handle_menu_callback, pattern="^menu_"))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(CallbackQueryHandler(handle_callback))
