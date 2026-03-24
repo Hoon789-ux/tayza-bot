@@ -2,6 +2,7 @@ import logging
 import os
 import base64
 import json
+import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -10,27 +11,98 @@ from telegram.ext import (
 import anthropic
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-BOT_TOKEN       = os.getenv("BOT_TOKEN")
-ADMIN_CHAT_ID   = int(os.getenv("ADMIN_CHAT_ID"))
-SECOND_ADMIN_ID = 8261222204  # MHK - second admin
-GROUP_INVITE    = os.getenv("GROUP_INVITE_LINK")
-ANTHROPIC_KEY   = os.getenv("ANTHROPIC_API_KEY")
-COURSE_PRICE    = "50,000 ကျပ်"
-KBZPAY_NUMBER   = os.getenv("KBZPAY_NUMBER", "09XXXXXXXXX")
-KBZPAY_NAME     = os.getenv("KBZPAY_NAME", "TayZa")
+BOT_TOKEN        = os.getenv("BOT_TOKEN")
+ADMIN_CHAT_ID    = int(os.getenv("ADMIN_CHAT_ID"))
+SECOND_ADMIN_ID  = 8261222204
+GROUP_INVITE     = os.getenv("GROUP_INVITE_LINK")
+ANTHROPIC_KEY    = os.getenv("ANTHROPIC_API_KEY")
+COURSE_PRICE     = "50,000 ကျပ်"
+KBZPAY_NUMBER    = os.getenv("KBZPAY_NUMBER", "09XXXXXXXXX")
+KBZPAY_NAME      = os.getenv("KBZPAY_NAME", "TayZa")
+
+SUPABASE_URL     = "https://fzqbrtxkanqubneltdqu.supabase.co"
+SUPABASE_KEY     = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZ6cWJydHhrYW5xdWJuZWx0ZHF1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQyOTUzMTEsImV4cCI6MjA4OTg3MTMxMX0.-4NarhDoyyU7-nl_r_Ck2BJzXwwJsnKHzxfKwZ4XG8c"
+
+ADMINS = (ADMIN_CHAT_ID, SECOND_ADMIN_ID)
 
 # ── LOGGING ───────────────────────────────────────────────────────────────────
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 
-# ── STATE TRACKING ────────────────────────────────────────────────────────────
-student_state: dict[int, str] = {}
-used_transaction_ids: set[str] = set()
+# ── SUPABASE HELPERS ──────────────────────────────────────────────────────────
+HEADERS = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json",
+    "Prefer": "return=representation"
+}
 
-# ── VIDEO FILE IDs (set by admin using commands) ───────────────────────────────
-welcome_video_id: str = None    # plays on /start
-enroll_video_id: str = None     # plays on /enroll
-approve_video_id: str = None    # plays when student is approved
+def db_get(table, filters=""):
+    r = httpx.get(f"{SUPABASE_URL}/rest/v1/{table}?{filters}", headers=HEADERS)
+    return r.json() if r.status_code == 200 else []
+
+def db_upsert(table, data):
+    r = httpx.post(
+        f"{SUPABASE_URL}/rest/v1/{table}",
+        headers={**HEADERS, "Prefer": "resolution=merge-duplicates,return=representation"},
+        json=data
+    )
+    return r.status_code in (200, 201)
+
+def db_update(table, data, filters):
+    r = httpx.patch(f"{SUPABASE_URL}/rest/v1/{table}?{filters}", headers=HEADERS, json=data)
+    return r.status_code in (200, 204)
+
+def db_delete(table, filters):
+    r = httpx.delete(f"{SUPABASE_URL}/rest/v1/{table}?{filters}", headers=HEADERS)
+    return r.status_code in (200, 204)
+
+# ── STUDENT STATE HELPERS ─────────────────────────────────────────────────────
+def get_student(uid):
+    rows = db_get("students", f"uid=eq.{uid}")
+    return rows[0] if rows else None
+
+def set_student_state(uid, state, name="", username=""):
+    db_upsert("students", {"uid": uid, "state": state, "name": name, "username": username})
+
+def get_state(uid):
+    s = get_student(uid)
+    return s["state"] if s else "new"
+
+# ── TRANSACTION ID HELPERS ────────────────────────────────────────────────────
+def is_duplicate_txn(txn_id):
+    if not txn_id:
+        return False
+    rows = db_get("transactions", f"txn_id=eq.{txn_id}")
+    return len(rows) > 0
+
+def save_txn(txn_id):
+    if txn_id:
+        db_upsert("transactions", {"txn_id": txn_id})
+
+# ── PENDING APPROVAL HELPERS ──────────────────────────────────────────────────
+def save_pending(uid, name, username, ai_summary, msg_id):
+    db_upsert("pending_approvals", {
+        "uid": uid,
+        "name": name,
+        "username": username,
+        "ai_summary": ai_summary,
+        "msg_id": msg_id
+    })
+
+def remove_pending(uid):
+    db_delete("pending_approvals", f"uid=eq.{uid}")
+
+# ── VIDEO HELPERS ─────────────────────────────────────────────────────────────
+def get_video(key):
+    rows = db_get("videos", f"key=eq.{key}")
+    return rows[0]["file_id"] if rows else None
+
+def set_video(key, file_id):
+    db_upsert("videos", {"key": key, "file_id": file_id})
+
+def remove_video(key):
+    db_update("videos", {"file_id": None}, f"key=eq.{key}")
 
 # ── MESSAGES ──────────────────────────────────────────────────────────────────
 WELCOME_MSG = """👋 မင်္ဂလာပါ!
@@ -94,107 +166,100 @@ DUPLICATE_MSG = """⚠️ ဒီ receipt ကို အသုံးပြီး�
 # ── ADMIN VIDEO COMMANDS ──────────────────────────────────────────────────────
 
 async def set_welcome_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global welcome_video_id
-    if update.effective_user.id not in (ADMIN_CHAT_ID, SECOND_ADMIN_ID):
+    if update.effective_user.id not in ADMINS:
         return
     if not update.message.reply_to_message or not update.message.reply_to_message.video:
         await update.message.reply_text("⚠️ Video message ကို reply လုပ်ပြီး /setwelcomevideo နှိပ်ပါ။")
         return
-    welcome_video_id = update.message.reply_to_message.video.file_id
-    await update.message.reply_text("✅ Welcome video (/start) set လုပ်ပြီး!\n\nRemove လုပ်ချင်ရင် /removewelcomevideo နှိပ်ပါ။")
-    log.info(f"Welcome video set: {welcome_video_id}")
-
+    set_video("welcome", update.message.reply_to_message.video.file_id)
+    await update.message.reply_text("✅ Welcome video (/start) set လုပ်ပြီး!")
 
 async def set_enroll_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global enroll_video_id
-    if update.effective_user.id not in (ADMIN_CHAT_ID, SECOND_ADMIN_ID):
+    if update.effective_user.id not in ADMINS:
         return
     if not update.message.reply_to_message or not update.message.reply_to_message.video:
         await update.message.reply_text("⚠️ Video message ကို reply လုပ်ပြီး /setenrollvideo နှိပ်ပါ။")
         return
-    enroll_video_id = update.message.reply_to_message.video.file_id
-    await update.message.reply_text("✅ Enroll video (/enroll) set လုပ်ပြီး!\n\nRemove လုပ်ချင်ရင် /removeenrollvideo နှိပ်ပါ။")
-    log.info(f"Enroll video set: {enroll_video_id}")
-
+    set_video("enroll", update.message.reply_to_message.video.file_id)
+    await update.message.reply_text("✅ Enroll video (/enroll) set လုပ်ပြီး!")
 
 async def set_approve_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global approve_video_id
-    if update.effective_user.id not in (ADMIN_CHAT_ID, SECOND_ADMIN_ID):
+    if update.effective_user.id not in ADMINS:
         return
     if not update.message.reply_to_message or not update.message.reply_to_message.video:
         await update.message.reply_text("⚠️ Video message ကို reply လုပ်ပြီး /setapprovevideo နှိပ်ပါ။")
         return
-    approve_video_id = update.message.reply_to_message.video.file_id
-    await update.message.reply_text("✅ Approve video set လုပ်ပြီး!\n\nRemove လုပ်ချင်ရင် /removeapprovevideo နှိပ်ပါ။")
-    log.info(f"Approve video set: {approve_video_id}")
-
+    set_video("approve", update.message.reply_to_message.video.file_id)
+    await update.message.reply_text("✅ Approve video set လုပ်ပြီး!")
 
 async def remove_welcome_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global welcome_video_id
-    if update.effective_user.id not in (ADMIN_CHAT_ID, SECOND_ADMIN_ID):
+    if update.effective_user.id not in ADMINS:
         return
-    welcome_video_id = None
-    await update.message.reply_text("✅ Welcome video ဖျက်ပြီး။ /start မှာ video မပါတော့ဘူး။")
-
+    remove_video("welcome")
+    await update.message.reply_text("✅ Welcome video ဖျက်ပြီး။")
 
 async def remove_enroll_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global enroll_video_id
-    if update.effective_user.id not in (ADMIN_CHAT_ID, SECOND_ADMIN_ID):
+    if update.effective_user.id not in ADMINS:
         return
-    enroll_video_id = None
-    await update.message.reply_text("✅ Enroll video ဖျက်ပြီး။ /enroll မှာ video မပါတော့ဘူး။")
-
+    remove_video("enroll")
+    await update.message.reply_text("✅ Enroll video ဖျက်ပြီး။")
 
 async def remove_approve_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global approve_video_id
-    if update.effective_user.id not in (ADMIN_CHAT_ID, SECOND_ADMIN_ID):
+    if update.effective_user.id not in ADMINS:
         return
-    approve_video_id = None
-    await update.message.reply_text("✅ Approve video ဖျက်ပြီး။ Approve မှာ video မပါတော့ဘူး။")
-
+    remove_video("approve")
+    await update.message.reply_text("✅ Approve video ဖျက်ပြီး။")
 
 async def video_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in (ADMIN_CHAT_ID, SECOND_ADMIN_ID):
+    if update.effective_user.id not in ADMINS:
         return
-    status = f"""📹 Video Status
+    w = get_video("welcome")
+    e = get_video("enroll")
+    a = get_video("approve")
+    await update.message.reply_text(f"""📹 Video Status
 
-/start video: {'✅ Set' if welcome_video_id else '❌ Not set'}
-/enroll video: {'✅ Set' if enroll_video_id else '❌ Not set'}
-Approve video: {'✅ Set' if approve_video_id else '❌ Not set'}"""
-    await update.message.reply_text(status)
-
+/start video: {'✅ Set' if w else '❌ Not set'}
+/enroll video: {'✅ Set' if e else '❌ Not set'}
+Approve video: {'✅ Set' if a else '❌ Not set'}""")
 
 # ── MAIN HANDLERS ─────────────────────────────────────────────────────────────
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    student_state[uid] = "new"
-    if welcome_video_id:
-        await ctx.bot.send_video(chat_id=uid, video=welcome_video_id)
+    name = update.effective_user.full_name
+    username = update.effective_user.username or ""
+    set_student_state(uid, "new", name, username)
+    vid = get_video("welcome")
+    if vid:
+        await ctx.bot.send_video(chat_id=uid, video=vid)
     await update.message.reply_text(WELCOME_MSG)
 
 
 async def enroll(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if student_state.get(uid) == "enrolled":
+    name = update.effective_user.full_name
+    username = update.effective_user.username or ""
+    if get_state(uid) == "enrolled":
         await update.message.reply_text("✅ မင်းက ဒီ program မှာ ဝင်ပြီးသားပါ! Group link ကို ယခင်က ပို့ပြီးပါပြီ။")
         return
-    student_state[uid] = "awaiting_screenshot"
-    if enroll_video_id:
-        await ctx.bot.send_video(chat_id=uid, video=enroll_video_id)
+    set_student_state(uid, "awaiting_screenshot", name, username)
+    vid = get_video("enroll")
+    if vid:
+        await ctx.bot.send_video(chat_id=uid, video=vid)
     await update.message.reply_text(ENROLL_MSG, parse_mode="Markdown")
 
 
 async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = update.effective_user
+    state = get_state(uid)
 
-    if student_state.get(uid) not in ("awaiting_screenshot", "new"):
+    if state not in ("awaiting_screenshot", "new"):
         await update.message.reply_text("ဝင်ရောက်ဖို့ အရင် /enroll နှိပ်ပါ။")
         return
 
     await update.message.reply_text(SCREENSHOT_RECEIVED_MSG)
-    student_state[uid] = "pending_approval"
+    set_student_state(uid, "pending_approval", user.full_name, user.username or "")
 
     photo = update.message.photo[-1]
     file = await ctx.bot.get_file(photo.file_id)
@@ -216,16 +281,14 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     {
                         "type": "text",
                         "text": f"""This is a payment screenshot for a course enrollment. The course costs {COURSE_PRICE} (50000 Myanmar Kyats).
-
 Please check:
 1. Is this a legitimate KBZPay payment screenshot?
 2. Does the amount match 50,000 MMK?
 3. What is the transaction ID or reference number?
 4. What is the transaction date and time?
 5. What is the recipient name?
-
 Reply in this exact JSON format only:
-{{"looks_valid": true/false, "amount_detected": "amount or null", "payment_method": "KBZPay/unknown", "transaction_id": "the exact transaction ID/reference number or null", "transaction_date": "date and time or null", "recipient_name": "name or null", "confidence": "high/medium/low", "notes": "brief note"}}"""
+{{"looks_valid": true/false, "amount_detected": "amount or null", "payment_method": "KBZPay/unknown", "transaction_id": "the exact transaction ID or null", "transaction_date": "date and time or null", "recipient_name": "name or null", "confidence": "high/medium/low", "notes": "brief note"}}"""
                     }
                 ]
             }]
@@ -236,28 +299,26 @@ Reply in this exact JSON format only:
             result_text = result_text[result_text.index("{"):result_text.rindex("}")+1]
         result = json.loads(result_text)
 
-        valid = result.get("looks_valid", False)
-        amount = result.get("amount_detected", "မသိ")
-        method = result.get("payment_method", "မသိ")
-        txn_id = result.get("transaction_id")
-        txn_date = result.get("transaction_date", "မသိ")
-        recipient = result.get("recipient_name", "မသိ")
-        confidence = result.get("confidence", "low")
-        notes = result.get("notes", "")
+        valid       = result.get("looks_valid", False)
+        amount      = result.get("amount_detected", "မသိ")
+        method      = result.get("payment_method", "မသိ")
+        txn_id      = result.get("transaction_id")
+        txn_date    = result.get("transaction_date", "မသိ")
+        recipient   = result.get("recipient_name", "မသိ")
+        confidence  = result.get("confidence", "low")
+        notes       = result.get("notes", "")
 
-        if txn_id and txn_id in used_transaction_ids:
+        # Duplicate check
+        if txn_id and is_duplicate_txn(txn_id):
             await update.message.reply_text(DUPLICATE_MSG)
-            student_state[uid] = "awaiting_screenshot"
+            set_student_state(uid, "awaiting_screenshot", user.full_name, user.username or "")
             await ctx.bot.send_message(
                 chat_id=ADMIN_CHAT_ID,
                 text=f"🚨 Duplicate receipt!\n\n👤 {user.full_name} (@{user.username or 'no username'})\n🆔 {uid}\n📋 Transaction ID: {txn_id}"
             )
             return
 
-        if txn_id:
-            used_transaction_ids.add(txn_id)
-
-        duplicate_warning = "⚠️ Transaction ID မတွေ့ — ဂရုစိုက်ပါ" if not txn_id else ""
+        save_txn(txn_id)
 
         ai_summary = f"""{'✅' if valid else '⚠️'} AI စစ်ဆေးချက် — {'Valid' if valid else 'Suspicious'}
 💰 Amount: {amount}
@@ -267,13 +328,13 @@ Reply in this exact JSON format only:
 👤 Recipient: {recipient}
 🎯 Confidence: {confidence}
 📝 {notes}
-{duplicate_warning}"""
+{'⚠️ Transaction ID မတွေ့ — ဂရုစိုက်ပါ' if not txn_id else ''}"""
 
     except Exception as e:
         log.error(f"Claude API error: {e}")
         ai_summary = "⚠️ AI စစ်ဆေးမရ — ကိုယ်တိုင် စစ်ဆေးပါ"
 
-    name = user.full_name
+    name     = user.full_name
     username = f"@{user.username}" if user.username else "username မရှိ"
 
     keyboard = InlineKeyboardMarkup([[
@@ -288,16 +349,19 @@ Reply in this exact JSON format only:
 
 {ai_summary}"""
 
-    await ctx.bot.forward_message(
+    # Forward screenshot and save to Supabase
+    fwd = await ctx.bot.forward_message(
         chat_id=ADMIN_CHAT_ID,
         from_chat_id=update.effective_chat.id,
         message_id=update.message.message_id
     )
-    await ctx.bot.send_message(
+    msg = await ctx.bot.send_message(
         chat_id=ADMIN_CHAT_ID,
         text=caption,
         reply_markup=keyboard
     )
+    # Save pending approval to Supabase — survives crashes
+    save_pending(uid, name, username, ai_summary, msg.message_id)
 
 
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -308,27 +372,24 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = int(uid_str)
 
     if action == "approve":
-        student_state[uid] = "enrolled"
-        if approve_video_id:
-            await ctx.bot.send_video(chat_id=uid, video=approve_video_id)
-        await ctx.bot.send_message(
-            chat_id=uid,
-            text=APPROVED_MSG + GROUP_INVITE
-        )
-        await query.edit_message_text(
-            text=query.message.text + "\n\n✅ APPROVED — Group link ပို့ပြီး"
-        )
+        set_student_state(uid, "enrolled")
+        remove_pending(uid)
+        vid = get_video("approve")
+        if vid:
+            await ctx.bot.send_video(chat_id=uid, video=vid)
+        await ctx.bot.send_message(chat_id=uid, text=APPROVED_MSG + GROUP_INVITE)
+        await query.edit_message_text(text=query.message.text + "\n\n✅ APPROVED — Group link ပို့ပြီး")
+
     elif action == "reject":
-        student_state[uid] = "awaiting_screenshot"
+        set_student_state(uid, "awaiting_screenshot")
+        remove_pending(uid)
         await ctx.bot.send_message(chat_id=uid, text=REJECTED_MSG)
-        await query.edit_message_text(
-            text=query.message.text + "\n\n❌ REJECTED — Student ကို အသိပေးပြီး"
-        )
+        await query.edit_message_text(text=query.message.text + "\n\n❌ REJECTED — Student ကို အသိပေးပြီး")
 
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    state = student_state.get(uid, "new")
+    uid   = update.effective_user.id
+    state = get_state(uid)
 
     if state == "new":
         await update.message.reply_text(WELCOME_MSG)
@@ -343,16 +404,16 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("enroll", enroll))
-    app.add_handler(CommandHandler("setwelcomevideo", set_welcome_video))
-    app.add_handler(CommandHandler("setenrollvideo", set_enroll_video))
-    app.add_handler(CommandHandler("setapprovevideo", set_approve_video))
-    app.add_handler(CommandHandler("removewelcomevideo", remove_welcome_video))
-    app.add_handler(CommandHandler("removeenrollvideo", remove_enroll_video))
-    app.add_handler(CommandHandler("removeapprovevideo", remove_approve_video))
-    app.add_handler(CommandHandler("videostatus", video_status))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(CommandHandler("start",               start))
+    app.add_handler(CommandHandler("enroll",              enroll))
+    app.add_handler(CommandHandler("setwelcomevideo",     set_welcome_video))
+    app.add_handler(CommandHandler("setenrollvideo",      set_enroll_video))
+    app.add_handler(CommandHandler("setapprovevideo",     set_approve_video))
+    app.add_handler(CommandHandler("removewelcomevideo",  remove_welcome_video))
+    app.add_handler(CommandHandler("removeenrollvideo",   remove_enroll_video))
+    app.add_handler(CommandHandler("removeapprovevideo",  remove_approve_video))
+    app.add_handler(CommandHandler("videostatus",         video_status))
+    app.add_handler(MessageHandler(filters.PHOTO,         handle_photo))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     log.info("Bot running...")
